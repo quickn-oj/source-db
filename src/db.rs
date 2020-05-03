@@ -2,15 +2,14 @@ use std::fs::{create_dir, File, OpenOptions};
 use std::path::PathBuf;
 
 use std::io::prelude::*;
-use std::io::{self, BufWriter, SeekFrom};
+use std::io::{self, BufReader, BufWriter, Read, SeekFrom, Write};
 
 use bincode::{deserialize, serialize_into};
 use compress::{entropy::ari, rle};
 use serde::{Deserialize, Serialize};
 
-pub const MASTER_DB: &'static str = "sources.qsdb";
-pub const DICTIONARY: &'static str = "dictionary";
-pub const DICTIONARY0: &'static str = "0.qsdd";
+pub const MASTER_DB: &'static str = "codes.qsdb";
+pub const DICTIONARY: &'static str = "dict.qsdd";
 pub const BYTES_HEDAER: usize = 11;
 pub const BYTES_BLOCK: usize = 16;
 pub const BYTES_DICTIONARY_HEADER: usize = 8;
@@ -78,9 +77,7 @@ impl DBFile {
         }
         Self::inner_write_header(source_db_root.clone(), header, Mode::Create)?;
 
-        create_dir(source_db_root.join(DICTIONARY))?;
         Self::inner_write_dict_header(
-            0,
             source_db_root.clone(),
             DictionaryHeader { len: 0 },
             Mode::Create,
@@ -124,15 +121,8 @@ impl DBFile {
         Ok(())
     }
 
-    pub fn inner_read_dict_header(
-        idx: u64,
-        source_db_root: PathBuf,
-    ) -> io::Result<DictionaryHeader> {
-        let mut dict_file = File::open(
-            source_db_root
-                .join(DICTIONARY)
-                .join(format!("{}.qsdd", idx)),
-        )?;
+    pub fn inner_read_dict_header(source_db_root: PathBuf) -> io::Result<DictionaryHeader> {
+        let mut dict_file = File::open(source_db_root.join(DICTIONARY))?;
         let mut dict_header_buf: [u8; BYTES_DICTIONARY_HEADER] = [0; BYTES_DICTIONARY_HEADER];
         dict_file.seek(SeekFrom::Start(0))?;
         dict_file.read_exact(&mut dict_header_buf)?;
@@ -141,42 +131,20 @@ impl DBFile {
     }
 
     pub fn inner_write_dict_header(
-        idx: u64,
         source_db_root: PathBuf,
         dict_header: DictionaryHeader,
         mode: Mode,
     ) -> io::Result<()> {
         let mut dict_file = match mode {
-            Mode::Modification => OpenOptions::new().write(true).open(
-                source_db_root
-                    .join(DICTIONARY)
-                    .join(format!("{}.qsdd", idx)),
-            )?,
-            _ => File::create(
-                source_db_root
-                    .join(DICTIONARY)
-                    .join(format!("{}.qsdd", idx)),
-            )?,
+            Mode::Modification => OpenOptions::new()
+                .write(true)
+                .open(source_db_root.join(DICTIONARY))?,
+            _ => File::create(source_db_root.join(DICTIONARY))?,
         };
         dict_file.seek(SeekFrom::Start(0))?;
         serialize_into(&mut dict_file, &dict_header).unwrap();
         dict_file.sync_all()?;
         Ok(())
-    }
-
-    pub fn dict_get(&self, idx: u64, i: u64) -> io::Result<DictionaryBlock> {
-        let mut dict_file = File::open(
-            self.source_db_root
-                .join(DICTIONARY)
-                .join(format!("{}.qsdd", idx)),
-        )?;
-        dict_file.seek(SeekFrom::Start(
-            (BYTES_DICTIONARY_HEADER as u64) + (BYTES_DICTIONARY_BLOCK as u64) * i,
-        ))?;
-        let mut dict_block_buf: [u8; BYTES_DICTIONARY_BLOCK] = [0; BYTES_DICTIONARY_BLOCK];
-        dict_file.read_exact(&mut dict_block_buf)?;
-        let dict_block: DictionaryBlock = deserialize(&dict_block_buf).unwrap();
-        Ok(dict_block)
     }
 
     pub fn header(&self) -> Header {
@@ -187,7 +155,7 @@ impl DBFile {
         self.source_db_root.clone()
     }
 
-    /// It costs O(lgn)
+    /// Time complexity : O(1)
     pub fn push(&mut self, source: &[u8], compress: bool) -> io::Result<()> {
         self.header.len += 1;
         Self::inner_write_header(self.source_db_root.clone(), self.header, Mode::Modification)?;
@@ -197,13 +165,6 @@ impl DBFile {
             .open(self.source_db_root.join(MASTER_DB))?;
         let metadata = db_file.metadata()?;
         self.push_dict(self.header.len, metadata.len())?;
-        let block: Block = Block {
-            nth: self.header.len,
-            len: source.len() as u64,
-        };
-        db_file.seek(SeekFrom::Start(metadata.len()))?;
-        serialize_into(&mut db_file, &block).ok();
-        db_file.seek(SeekFrom::Start(metadata.len() + (BYTES_BLOCK as u64)))?;
         if compress {
             // Double encoding by arithmetic encoder and run-length encoder
             let mut encoder_rle = rle::Encoder::new(Vec::new());
@@ -213,57 +174,83 @@ impl DBFile {
             encoder_ari.write_all(&buf_rle).unwrap();
             let (buf_ari, _) = encoder_ari.finish();
             let inner = buf_ari.into_inner().unwrap();
+            let block: Block = Block {
+                nth: self.header.len,
+                len: inner.len() as u64,
+            };
+            db_file.seek(SeekFrom::End(0))?;
+            serialize_into(&mut db_file, &block).ok();
+            db_file.seek(SeekFrom::End(0))?;
             db_file.write_all(&inner)?;
         } else {
+            let block: Block = Block {
+                nth: self.header.len,
+                len: source.len() as u64,
+            };
+            db_file.seek(SeekFrom::End(0))?;
+            serialize_into(&mut db_file, &block).ok();
+            db_file.seek(SeekFrom::End(0))?;
             db_file.write_all(source)?;
         }
         db_file.sync_all()?;
         Ok(())
     }
 
-    pub fn push_dict(&self, idx: u64, offset: u64) -> io::Result<()> {
-        // TODO: Reduce some overhead
-        // - too many file open(s) occur
-        //let dict_header = Self::inner_read_dict_header(0, self.source_db_root.clone())?;
-        //dict_header.len += 1;
-        let mut pivot: u64 = 1 << self.header.divisor_exp;
-        let mut current: u64 = idx;
-        let mut i = 0;
-        loop {
-            if current % pivot == 0 {
-                let mut dict_header = Self::inner_read_dict_header(i, self.source_db_root.clone())?;
-                dict_header.len += 1;
-                Self::inner_write_dict_header(
-                    i,
-                    self.source_db_root.clone(),
-                    dict_header,
-                    Mode::Modification,
-                )?;
-                let mut dict_file = OpenOptions::new().write(true).open(
-                    self.source_db_root
-                        .clone()
-                        .join(DICTIONARY)
-                        .join(format!("{}.qsdd", i)),
-                )?;
-                let dict_block = DictionaryBlock {
-                    nth: idx,
-                    offset: offset,
-                };
-                dict_file.seek(SeekFrom::End(0))?;
-                serialize_into(&mut dict_file, &dict_block).ok();
-                break;
-            }
-            let current_block = self.dict_get(i, current / pivot)?;
-            i = current_block.nth;
-            current %= pivot;
-            pivot >>= 1;
-        }
+    /// Time complexity : O(1)
+    pub fn push_dict(&self, nth: u64, offset: u64) -> io::Result<()> {
+        let mut dict_header = Self::inner_read_dict_header(self.source_db_root.clone())?;
+        dict_header.len += 1;
         Self::inner_write_dict_header(
-            idx,
             self.source_db_root.clone(),
-            DictionaryHeader { len: 0 },
-            Mode::Create,
+            dict_header,
+            Mode::Modification,
         )?;
+        let mut dict_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.source_db_root.join(DICTIONARY))?;
+        let dict_block: DictionaryBlock = DictionaryBlock {
+            nth: nth,
+            offset: offset,
+        };
+        dict_file.seek(SeekFrom::End(0))?;
+        serialize_into(&mut dict_file, &dict_block).ok();
         Ok(())
+    }
+
+    pub fn get(&self, i: u64, compressed: bool) -> io::Result<Vec<u8>> {
+        let dict_block = self.get_dict(i)?;
+        let mut db_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.source_db_root.join(MASTER_DB))?;
+        db_file.seek(SeekFrom::Start(dict_block.offset))?;
+        let mut block_buf: [u8; BYTES_BLOCK] = [0; BYTES_BLOCK];
+        db_file.read_exact(&mut block_buf)?;
+        let block: Block = deserialize(&block_buf).unwrap();
+        db_file.seek(SeekFrom::Start(dict_block.offset + (BYTES_BLOCK as u64)))?;
+        let mut buf: Vec<u8> = vec![0; block.len as usize];
+        db_file.read_exact(&mut buf)?;
+        if compressed {
+            let mut decoder_ari = ari::ByteDecoder::new(BufReader::new(&buf[..]));
+            let mut decoded_ari = Vec::new();
+            decoder_ari.read_to_end(&mut decoded_ari).unwrap();
+            let mut decoder_rle = rle::Decoder::new(&decoded_ari[..]);
+            let mut decoded_rle = Vec::new();
+            decoder_rle.read_to_end(&mut decoded_rle).unwrap();
+            buf = decoded_rle;
+        }
+        Ok(buf)
+    }
+
+    pub fn get_dict(&self, i: u64) -> io::Result<DictionaryBlock> {
+        let mut dict_file = File::open(self.source_db_root.join(DICTIONARY))?;
+        dict_file.seek(SeekFrom::Start(
+            (BYTES_DICTIONARY_HEADER as u64) + (BYTES_DICTIONARY_BLOCK as u64) * i,
+        ))?;
+        let mut dict_block_buf: [u8; BYTES_DICTIONARY_BLOCK] = [0; BYTES_DICTIONARY_BLOCK];
+        dict_file.read_exact(&mut dict_block_buf)?;
+        let dict_block: DictionaryBlock = deserialize(&dict_block_buf).unwrap();
+        Ok(dict_block)
     }
 }
